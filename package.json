@@ -1,0 +1,42 @@
+{
+  "name": "openchamber-git-graph",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Work Status section that displays the current project's commit graph",
+  "openchamber": {
+    "apiVersion": 1,
+    "contributes": {
+      "panel": {
+        "id": "git-graph",
+        "name": "Git Graph",
+        "icon": "git-commit"
+      },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Git Graph",
+        "height": 160,
+        "defaultExpanded": false,
+        "requiresProject": true
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "permissions": {
+          "exec": [
+            "git"
+          ]
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.3.3",
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.9.2"
+  }
+}
