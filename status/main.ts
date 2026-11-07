@@ -164,6 +164,34 @@ const details = new Map<string, DetailState>();
 const popoverAnchors = new Set<{ dispose: () => void }>();
 let generation = 0;
 
+const POLL_INTERVAL_MS = 2_000;
+let pollTimer: number | null = null;
+
+const clearPollTimer = () => {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+};
+
+const startPolling = () => {
+  if (!directory) {
+    clearPollTimer();
+    return;
+  }
+  clearPollTimer();
+  pollTimer = window.setInterval(() => {
+    if (!directory) return;
+    void load().catch(() => undefined);
+  }, POLL_INTERVAL_MS);
+};
+
+const stopStatus = () => {
+  clearPollTimer();
+  for (const anchor of popoverAnchors) anchor.dispose();
+  popoverAnchors.clear();
+};
+
 const refKey = (ref: { name: string; kind: RefKind }) => `${ref.kind}:${ref.name}`;
 
 // Storage keys are capped at 128 characters, so a project is named by a hash of its path.
@@ -229,6 +257,7 @@ const load = async () => {
   const current = ++generation;
   if (!directory) {
     commits = []; note = 'Open a project to see its commits.'; render();
+    clearPollTimer();
     return;
   }
   if (commits.length === 0) { note = 'Loading commits…'; render(); }
@@ -247,10 +276,12 @@ const load = async () => {
     details.clear();
     if (openHash && !commits.some((commit) => commit.hash === openHash)) openHash = null;
     if (openHash) void loadDetail(openHash);
+    startPolling();
   } catch (error) {
     if (current !== generation) return;
     commits = [];
     note = error instanceof ServiceFailure ? error.message : 'Could not read the git history.';
+    clearPollTimer();
   }
   render();
 };
@@ -536,6 +567,7 @@ host.onDirectory((next) => {
   publishingControls = null;
   statusControlsActive = false;
   commits = []; refs = null; openHash = null; details.clear();
+  stopStatus();
   void (async () => {
     if (next) await loadPrefs(next, deviceStorageSupported);
     if (directory !== next) return;
