@@ -6,6 +6,9 @@ An OpenChamber extension that displays the current project's commit graph in the
 
 Helps users quickly see branch structure, recent commits, and open a commit's details without leaving the chat context.
 
+<img width=30% height=30% alt="CleanShot 2026-11-07 at 09 11 53" src="https://github.com/user-attachments/assets/a3686393-e9e5-4936-8cfc-bf218dd2e7f2" />
+
+
 ## Features
 
 - Lane-based commit graph layout showing branch structure and merges.
