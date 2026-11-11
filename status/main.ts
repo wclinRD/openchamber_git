@@ -376,10 +376,12 @@ const renderPicker = () => {
       const checkbox = document.createElement('label');
       checkbox.style.cssText = 'font-size: 11px; display: flex; align-items: center; gap: 4px;';
       const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = picked.has(refKey(ref));
+      input.type = 'radio';
+      const key = refKey(ref);
+      input.name = 'manual-ref';
+      input.checked = picked.has(key) && picked.size === 1;
       input.addEventListener('change', () => {
-        if (input.checked) picked.add(refKey(ref)); else picked.delete(refKey(ref));
+        if (input.checked) picked = new Set([key]); else picked = new Set();
         savePrefs();
         void load();
       });
