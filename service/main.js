@@ -2,6 +2,7 @@
 import { execFile } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
+import * as fs from "node:fs";
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
 if (!port || !token) {
@@ -16,6 +17,43 @@ var RECORD = "\x1E";
 var SHA = /^[0-9a-f]{7,64}$/i;
 var LOG_FORMAT = ["%H", "%P", "%an", "%ar", "%aI", "%D", "%s"].join("%x1f") + "%x1e";
 var SHOW_FORMAT = ["%H", "%P", "%an", "%ae", "%ar", "%aI", "%s", "%b"].join("%x1f");
+var MAX_DISCOVERED = 30;
+var discoverNestedRepos = (root) => {
+  const found = [];
+  try {
+    if (!fs.existsSync(root) || !fs.statSync(root).isDirectory())
+      return found;
+  } catch {
+    return found;
+  }
+  const scan = (dir, depth) => {
+    if (depth > 2)
+      return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.name || entry.name === ".git")
+          continue;
+        if (entry.name === "node_modules" || entry.name.startsWith("dist") || entry.name.includes(".min."))
+          continue;
+        if (entry.isDirectory() && !entry.name.startsWith(".")) {
+          const child = path.join(dir, entry.name);
+          try {
+            if (found.length >= MAX_DISCOVERED)
+              return;
+            if (fs.existsSync(path.join(child, ".git"))) {
+              found.push({ dir: child, label: entry.name });
+              continue;
+            }
+          } catch {}
+          scan(child, depth + 1);
+        } else if (entry.isFile() && entry.name === ".git") {} else if (entry.isSymbolicLink()) {} else if (entry.name.startsWith(".")) {}
+      }
+    } catch {}
+  };
+  scan(root, 0);
+  return found.slice(0, MAX_DISCOVERED).sort((a, b) => a.label.localeCompare(b.label));
+};
 var json = (res, status, body) => {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
@@ -159,6 +197,15 @@ var server = http.createServer((req, res) => {
     return;
   }
   const directory = url.searchParams.get("directory") ?? "";
+  if (req.method === "GET" && url.pathname === "/discover") {
+    if (!path.isAbsolute(directory)) {
+      json(res, 400, { error: "bad-request" });
+    } else {
+      const repos = discoverNestedRepos(directory);
+      json(res, 200, { repositories: repos });
+    }
+    return;
+  }
   if (req.method !== "GET" || !["/log", "/refs", "/commit"].includes(url.pathname)) {
     json(res, 404, { error: "not-found" });
     return;

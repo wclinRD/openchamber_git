@@ -4,6 +4,7 @@
 import { execFile } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
+import * as fs from 'node:fs';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -41,7 +42,57 @@ type GitResult = { ok: true; stdout: string } | { ok: false; failure: Failure };
 type RefsResult = { ok: true; value: Refs } | { ok: false; failure: Failure };
 type RevisionsResult = { ok: true; revisions: string[] } | { ok: false; failure: Failure };
 
-const json = (res: http.ServerResponse, status: number, body: Answer): void => {
+type DiscoveredRepo = {
+  dir: string; // absolute path of the working tree to operate on with `git -C`
+  label: string; // user-visible name, usually the basename of dir when below project root
+};
+
+const MAX_DISCOVERED = 30;
+
+const discoverNestedRepos = (root: string): DiscoveredRepo[] => {
+  const found: DiscoveredRepo[] = [];
+
+  try {
+    if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return found;
+  } catch {
+    return found;
+  }
+
+  const scan = (dir: string, depth: number): void => {
+    if (depth > 2) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.name || entry.name === '.git') continue; // avoid scanning the top-level `.git`
+        if (entry.name === 'node_modules' || entry.name.startsWith('dist') || entry.name.includes('.min.')) continue;
+        if (entry.isDirectory() && !entry.name.startsWith('.')) {
+          const child = path.join(dir, entry.name);
+          try {
+            if (found.length >= MAX_DISCOVERED) return;
+            // Check whether the child is its own git working tree.
+            if (fs.existsSync(path.join(child, '.git'))) {
+              found.push({ dir: child, label: entry.name });
+              continue; // do not recurse into discovered repo.
+            }
+          } catch {}
+          scan(child, depth + 1);
+        } else if (entry.isFile() && entry.name === '.git') {
+          // Rare case: direct file .git inside project child is a worktree reference;
+          // still the parent directory is its working tree, but we only look at directories for now.
+        } else if (entry.isSymbolicLink()) {
+          // Skip symlinks to avoid infinite loops.
+        } else if (entry.name.startsWith('.')) {
+          // Skip other hidden entries including worktree `.git/**` directories.
+        }
+      }
+    } catch {}
+  };
+
+  scan(root, 0);
+  return found.slice(0, MAX_DISCOVERED).sort((a, b) => a.label.localeCompare(b.label));
+};
+
+const json = (res: http.ServerResponse, status: number, body: Answer | { repositories?: DiscoveredRepo[] }): void => {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 };
@@ -184,6 +235,17 @@ const server = http.createServer((req, res) => {
     return;
   }
   const directory = url.searchParams.get('directory') ?? '';
+
+  if (req.method === 'GET' && url.pathname === '/discover') {
+    if (!path.isAbsolute(directory)) {
+      json(res, 400, { error: 'bad-request' });
+    } else {
+      const repos = discoverNestedRepos(directory);
+      json(res, 200, { repositories: repos });
+    }
+    return;
+  }
+
   if (req.method !== 'GET' || !['/log', '/refs', '/commit'].includes(url.pathname)) {
     json(res, 404, { error: 'not-found' });
     return;

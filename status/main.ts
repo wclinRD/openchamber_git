@@ -2,6 +2,7 @@
 // and Open diff in the Diff view. Reads from the local git service.
 import { connectHost, HostRequestError, type SessionLifecyclePhase } from '@openchamber/sdk';
 import { applyHostReady, mountButton, mountTabs } from '@openchamber/sdk/ui';
+import type { GuestStatusControl } from '@openchamber/sdk';
 
 import { layoutGraph } from './graph.ts';
 import { STYLE, drawRail, drawRowGraph, element, graphWidth, refBadge, type RefKind } from './view.ts';
@@ -31,7 +32,7 @@ host.onStatusControl((event) => {
     void load();
     return;
   }
-  if (event.id === 'header-mode' && event.value) setMode(event.value);
+  if (event.id === 'header-mode' && event.value) { setMode(event.value); return; }
 });
 // ----- Service answers, parsed at the boundary -----
 
@@ -109,6 +110,35 @@ const detailSchema = (value: unknown): { hash: string; parents: string[]; author
 
 const failureSchema = (value: unknown): value is { error: string } => isRecord(value) && isString(value.error);
 const modeSchema = (value: string): value is 'auto' | 'all' | 'manual' => value === 'auto' || value === 'all' || value === 'manual';
+type DiscoveredRepo = { dir: string; label: string };
+
+const discoveredSchema = (value: unknown): { repositories: DiscoveredRepo[] } | null => {
+  if (!isRecord(value)) return null;
+  const repos = value.repositories;
+  if (!Array.isArray(repos)) return null;
+  for (const repo of repos) {
+    if (!isRecord(repo)) return null;
+    const dir = repo.dir;
+    const label = repo.label;
+    if (typeof dir !== 'string' || !/[a-z]:\\/i.test(dir) && !dir.startsWith('/') || typeof label !== 'string') return null;
+  }
+  return { repositories: repos.map((repo) => ({ dir: repo.dir, label: repo.label })) };
+};
+
+type Failure = 'unauthorized' | 'not-found' | 'bad-request' | 'no-git' | 'not-a-repo' | 'unknown-commit' | 'git-failed';
+
+const askRaw = async <T>(path: string, query: Record<string, string>, schema?: (value: unknown) => T | null): Promise< { error?: Failure; value?: T } > => {
+  let result;
+  try { result = await host.serviceRequest({ method: 'GET', path, query }); } catch (error) {
+    return { error: 'git-failed' };
+  }
+  let body;
+  try { body = JSON.parse(result.body); } catch { return { error: 'git-failed' }; }
+  if (failureSchema(body)) return { error: body.error as Failure };
+  const parsed = schema ? schema(body) : (body as T);
+  if (!parsed && !(parsed === null || parsed === false)) return { error: 'git-failed' };
+  return { value: (parsed === null || parsed === false) ? (null as any) : (parsed as T) };
+};
 
 type Commit = { hash: string; parents: string[]; author: string; when: string; date: string; subject: string; refs: { name: string; kind: 'local' | 'remote' | 'tag'; head: boolean }[] };
 type Refs = { branch: string | null; upstream: string | null; github: string | null; refs: { name: string; kind: 'local' | 'remote' | 'tag' }[] };
@@ -136,7 +166,7 @@ const ask = async <T>(path: string, query: Record<string, string>, schema: (valu
   }
   let body: unknown;
   try { body = JSON.parse(result.body); } catch { throw new ServiceFailure('The git service answered with something unexpected.'); }
-  if (failureSchema(body)) throw new ServiceFailure((body as { error: string }).error === 'unknown-commit' ? 'That commit is no longer in this repository.' : describeFailure('unknown-commit'));
+  if (failureSchema(body)) throw new ServiceFailure((body as { error: string }).error === 'unknown-commit' ? 'That commit is no longer in this repository.' : describeFailure((body as { error: string }).error));
   const parsed = schema(body);
   if (!parsed) throw new ServiceFailure('The git service answered with something unexpected.');
   return parsed;
@@ -144,7 +174,11 @@ const ask = async <T>(path: string, query: Record<string, string>, schema: (valu
 
 // ----- State -----
 
-let directory: string | null = null;
+let directory: string | null = null; // host's open project root (use this for discovery scanning)
+let selectedGitDir: string | null = null; // chosen nested git repo working tree. Auto-selected from discovered repos if set.
+let discoveredRepos: DiscoveredRepo[] | null = null;
+
+let repositorySelectElement: HTMLSelectElement | null = null;
 let locale = 'en';
 let mode: Mode = 'auto';
 let picked = new Set<string>();
@@ -251,7 +285,45 @@ const loadPrefs = async (dir: string, useDeviceStorage: boolean) => {
   picked = new Set(validPicked.slice(0, 50));
 };
 
-// ----- Loading -----
+// ----- Loading / Discovery -----
+
+const attemptDiscovery = async (): Promise<DiscoveredRepo[] | null> => {
+  const raw = await askRaw('/discover', { directory: directory! });
+  if (raw.error === 'not-a-repo' || raw.error) return null;
+  const parsed = discoveredSchema(raw.value ?? { repositories: [] });
+  if (!parsed || !Array.isArray(parsed.repositories)) return null;
+  discoveredRepos = parsed.repositories;
+  // Auto-select the first found repo instead of forcing user to choose from a button list.
+  const firstRepo = parsed.repositories[0];
+  if (firstRepo) {
+    selectedGitDir = firstRepo.dir;
+    note = null; // allow graph and repo selector to render.
+  } else {
+    selectedGitDir = null;
+    note = null; // falls through to fallback message in load.
+  }
+  commits = []; refs = null; openHash = null; details.clear();
+  clearPollTimer();
+  return parsed.repositories.length > 0 ? discoveredRepos : null;
+};
+
+const dirForGit = (): string | null => selectedGitDir || directory;
+
+const loadDetailAt = async (hash: string, useDirectory?: string | null) => {
+  const known = details.get(hash)?.status;
+  if (known === 'ready' || known === 'loading') return;
+  const dir = useDirectory !== undefined ? useDirectory : (selectedGitDir || directory);
+  if (!dir) return;
+  details.set(hash, { status: 'loading' });
+  render();
+  try {
+    const detail = await ask('/commit', { directory: dir, sha: hash }, detailSchema);
+    details.set(hash, { status: 'ready', detail });
+  } catch (error) {
+    details.set(hash, { status: 'error', message: error instanceof ServiceFailure ? error.message : 'Could not read this commit.' });
+  }
+  render();
+};
 
 const load = async () => {
   const current = ++generation;
@@ -260,42 +332,48 @@ const load = async () => {
     clearPollTimer();
     return;
   }
-  if (commits.length === 0) { note = 'Loading commits…'; render(); }
-  const dir = directory;
+
+  const useDirectory = selectedGitDir || directory;
+  if (commits.length === 0 && !selectedGitDir) note = 'Loading commits…';
+
   try {
     const [nextRefs, log] = await Promise.all([
-      ask('/refs', { directory: dir }, refsSchema),
-      ask('/log', { directory: dir, mode, refs: [...picked].join(','), limit: '40' }, parseLog),
+      ask('/refs', { directory: useDirectory! }, refsSchema),
+      ask('/log', { directory: useDirectory!, mode, refs: [...picked].join(','), limit: '40' }, parseLog),
     ]);
     if (current !== generation) return;
     refs = nextRefs;
     commits = log.commits;
     uncommitted = mode === 'manual' ? 0 : log.uncommitted;
-    note = commits.length === 0 ? 'No commits yet.' : null;
-    // A detail read before a refresh may describe a rewritten commit.
+    note = commits.length === 0 && discoveredRepos === null ? 'No commits yet.' : null;
     details.clear();
     if (openHash && !commits.some((commit) => commit.hash === openHash)) openHash = null;
-    if (openHash) void loadDetail(openHash);
+    if (openHash) void loadDetailAt(openHash);
     startPolling();
+
+    // Always sync status controls after reading successful history so a newly-discovered selector is visible.
+    if (statusControlsSupported) publishStatusControls();
   } catch (error) {
     if (current !== generation) return;
-    commits = [];
-    note = error instanceof ServiceFailure ? error.message : 'Could not read the git history.';
-    clearPollTimer();
-  }
-  render();
-};
-
-const loadDetail = async (hash: string) => {
-  const known = details.get(hash)?.status;
-  if (!directory || known === 'ready' || known === 'loading') return;
-  details.set(hash, { status: 'loading' });
-  render();
-  try {
-    const detail = await ask('/commit', { directory, sha: hash }, detailSchema);
-    details.set(hash, { status: 'ready', detail });
-  } catch (error) {
-    details.set(hash, { status: 'error', message: error instanceof ServiceFailure ? error.message : 'Could not read this commit.' });
+    commits = []; openHash = null; details.clear();
+    let message: string | null = error instanceof ServiceFailure ? error.message : 'Could not read the git history.';
+    // If the failure is "not-a-repo" and discovery has not already been attempted, try scanning subdirectories.
+    if (message === 'This project is not a git repository.' && selectedGitDir === null) {
+      const repos = await attemptDiscovery();
+      if (repos && discoveredRepos) {
+        // Auto-selected the first repo; fetch its history immediately so the graph appears without pressing Refresh.
+        await load();
+        return; // new load will render when it completes.
+      } else {
+        note = message;
+      }
+    } else if (selectedGitDir !== null) {
+      // Failure on the selected nested repo is a user-facing error message.
+      note = message;
+    } else {
+      // No selected repo, no discovered repos, or other failures show the message directly.
+      note = message;
+    }
   }
   render();
 };
@@ -306,22 +384,30 @@ const bar = element('div', 'bar');
 const picker = element('div', 'picker');
 const preferencesNotice = element('div', 'note');
 const list = element('div');
-root.append(bar, picker, preferencesNotice, list);
+// Dedicated bar for the nested repository selector; it stays visible when Host status controls replace the local bar.
+const repoBar = element('div', 'bar');
+root.append(bar, picker, preferencesNotice, repoBar, list);
+repoBar.hidden = true; // we will show it only when there are discovered repos.
 
-const statusControls = () => [
-  {
-    kind: 'select' as const,
-    id: 'header-mode',
-    label: 'Commit range',
-    value: mode,
-    options: [
-      { value: 'auto', label: 'Auto' },
-      { value: 'all', label: 'All' },
-      { value: 'manual', label: 'Manual' },
-    ],
-  },
-  { kind: 'button' as const, id: 'header-refresh', label: 'Refresh', disabled: !directory },
-];
+const statusControls = () => {
+  const controls: GuestStatusControl[] = [
+    {
+      kind: 'select',
+      id: 'header-mode',
+      label: 'Commit range',
+      value: mode,
+      options: [
+        { value: 'auto', label: 'Auto' },
+        { value: 'all', label: 'All' },
+        { value: 'manual', label: 'Manual' },
+      ],
+      disabled: !directory,
+    },
+    { kind: 'button', id: 'header-refresh', label: 'Refresh', disabled: !directory },
+  ];
+
+  return controls;
+};
 
 const publishStatusControls = () => {
   if (!statusControlsSupported) return;
@@ -453,6 +539,73 @@ const renderDetail = (card: HTMLElement, commit: Commit) => {
   card.append(who, when, stats, hashRow, actions, status);
 };
 
+const handleRepositorySelectorChange = (value: string): void => {
+  const chosen = discoveredRepos?.find((repo) => repo.label === value);
+  if (!chosen || chosen.dir === selectedGitDir) return;
+  selectedGitDir = chosen.dir;
+  commits = []; refs = null; openHash = null; details.clear(); picked = new Set();
+  note = 'Loading commits…';
+  publishStatusControls();
+  void load().catch(() => undefined);
+};
+
+const ensureRepositorySelector = () => {
+  if (!discoveredRepos || discoveredRepos.length === 0) return;
+
+  let repoLabel: string | null = selectedGitDir ? discoveredRepos!.find((r) => r.dir === selectedGitDir)?.label ?? basename(selectedGitDir) : null;
+  if (!repoLabel && discoveredRepos!.length > 0) {
+    const first = discoveredRepos![0] as NonNullable<DiscoveredRepo>;
+    repoLabel = String(first.label);
+  }
+
+  if (!repositorySelectElement) {
+    repositorySelectElement = document.createElement('select');
+    // Use a wider base style for the repo selector so full names like 'NotesLiquidGlass' are readable.
+    repositorySelectElement.style.cssText = 'font: inherit; color: var(--oc-fg); background: color-mix(in srgb, var(--oc-elevated) 80%, transparent); border:1.5px solid color-mix(in srgb, var(--oc-border) 80%, transparent); border-radius:var(--oc-radius); padding:2px 6px; font-size:11px; width:150px; white-space:normal;';
+    // When Host status controls are active, the regular bar is hidden; place the repo selector in its own dedicated row.
+    // Otherwise, put it inline next to Refresh within the local bar.
+    const targetBar = statusControlsActive ? repoBar : bar;
+    targetBar.appendChild(repositorySelectElement);
+    repositorySelectElement.addEventListener('change', () => {
+      if (!repositorySelectElement) return;
+      handleRepositorySelectorChange(repositorySelectElement.value);
+    });
+  } else if (repositorySelectElement.isConnected) {
+    // Ensure it is in the correct container for current Active state.
+    const targetBar = statusControlsActive ? repoBar : bar;
+    if (repositorySelectElement.parentElement !== targetBar) {
+      targetBar.appendChild(repositorySelectElement);
+    }
+    // Keep the wider style.
+    repositorySelectElement.style.width = '150px';
+  }
+
+  // Replace options with the current list and selected value.
+  repositorySelectElement.replaceChildren();
+  for (const repo of discoveredRepos) {
+    const option = document.createElement('option');
+    option.value = repo.label;
+    option.textContent = repo.label;
+    repositorySelectElement.appendChild(option);
+  }
+  repositorySelectElement.value = repoLabel ?? (discoveredRepos![0] as NonNullable<DiscoveredRepo>).label; // guaranteed by discovery checks.
+};
+
+const removeRepositorySelectorIfNeeded = () => {
+  if (!discoveredRepos || discoveredRepos.length === 0) return;
+  // Do not remove selector once a nested repo has been selected. It allows future switching between found repos.
+};
+
+const replaceRepositorySelectorWithHostControl = () => {
+  if (!repositorySelectElement || discoveredRepos === null) return;
+  bar.removeChild(repositorySelectElement);
+  repositorySelectElement = null;
+};
+
+const basename = (pathStr: string): string => {
+  const parts = pathStr.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? pathStr;
+};
 const render = () => {
   for (const anchor of popoverAnchors) anchor.dispose();
   popoverAnchors.clear();
@@ -461,6 +614,13 @@ const render = () => {
   preferencesNotice.textContent = preferencesError ?? '';
   refresh.update({ disabled: !directory });
   renderPicker();
+
+  // Insert the nested repo selector into the header if discovery found repos.
+  ensureRepositorySelector();
+
+  // Make sure its container is visible exactly when repos are discovered.
+  repoBar.hidden = !(discoveredRepos && discoveredRepos.length > 0);
+
   if (note) {
     list.replaceChildren(element('div', 'note', note));
     return;
@@ -504,7 +664,7 @@ const render = () => {
     head.addEventListener('click', () => {
       openHash = open ? null : commit.hash;
       render();
-      if (openHash) void loadDetail(openHash);
+      if (openHash) void loadDetailAt(openHash);
     });
     if (popoversSupported) {
       // Popover anchors are no-ops in this frame-only build; skip mounting them.
@@ -568,6 +728,8 @@ host.onDirectory((next) => {
   publishedControls = null;
   publishingControls = null;
   statusControlsActive = false;
+  selectedGitDir = null;
+  discoveredRepos = null;
   commits = []; refs = null; openHash = null; details.clear();
   stopStatus();
   void (async () => {
